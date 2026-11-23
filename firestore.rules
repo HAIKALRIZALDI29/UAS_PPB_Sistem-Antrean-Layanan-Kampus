@@ -1,0 +1,142 @@
+rules_version = '2';
+
+// DRAFT Security Rules CampusQueue (Mahasiswa B).
+// STATUS: belum diuji di emulator / Rules Playground.
+// Jangan di-deploy ke project sebelum diuji (lihat docs/arsitektur.md).
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------- Fungsi bantu ----------------
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function profilePath() {
+      return /databases/$(database)/documents/users/$(request.auth.uid);
+    }
+
+    function hasProfile() {
+      return signedIn() && exists(profilePath());
+    }
+
+    function profile() {
+      return get(profilePath()).data;
+    }
+
+    function isMahasiswa() {
+      return hasProfile() && profile().role == 'mahasiswa';
+    }
+
+    function isPetugas() {
+      return hasProfile() && profile().role == 'petugas';
+    }
+
+    // Petugas hanya boleh mengelola unit sesuai layananId di profilnya.
+    function petugasOf(layananId) {
+      return isPetugas() && profile().layananId == layananId;
+    }
+
+    // ---------------- users ----------------
+
+    match /users/{uid} {
+      // Hanya membaca profil sendiri.
+      allow read: if signedIn() && request.auth.uid == uid;
+
+      // Registrasi publik hanya boleh membuat role mahasiswa.
+      // Akun petugas dibuat pengembang lewat Firebase Console.
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['nama', 'nim', 'role'])
+        && request.resource.data.role == 'mahasiswa'
+        && request.resource.data.nama is string
+        && request.resource.data.nim is string;
+
+      // Role tidak boleh diubah dari aplikasi.
+      allow update, delete: if false;
+    }
+
+    // ---------------- layanan ----------------
+
+    match /layanan/{layananId} {
+      allow read: if signedIn();
+
+      // Data layanan dibuat lewat Console / seed saat setup.
+      allow create, delete: if false;
+
+      // Petugas unit tersebut hanya boleh membuka/menutup layanan.
+      allow update: if petugasOf(layananId)
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['isOpen']);
+
+      // ------ counter harian ------
+
+      match /harian/{tanggal} {
+        allow read: if signedIn();
+
+        allow create: if (petugasOf(layananId) || isMahasiswa())
+          && request.resource.data.keys()
+              .hasOnly(['lastNumber', 'currentNumber'])
+          && request.resource.data.currentNumber == 0
+          && (request.resource.data.lastNumber == 0
+              || (isMahasiswa() && request.resource.data.lastNumber == 1));
+
+        allow update:
+          // Petugas: hanya currentNumber (nomor yang sedang dilayani).
+          if (petugasOf(layananId)
+              && request.resource.data.diff(resource.data).affectedKeys()
+                  .hasOnly(['currentNumber']))
+          // Mahasiswa: hanya lastNumber, naik tepat satu (ambil nomor).
+          || (isMahasiswa()
+              && request.resource.data.diff(resource.data).affectedKeys()
+                  .hasOnly(['lastNumber'])
+              && request.resource.data.lastNumber == resource.data.lastNumber + 1);
+
+        allow delete: if false;
+      }
+    }
+
+    // ---------------- antrean ----------------
+
+    match /antrean/{antreanId} {
+      // Mahasiswa hanya membaca tiket miliknya.
+      // Petugas membaca tiket unitnya.
+      allow read: if signedIn()
+        && (resource.data.uid == request.auth.uid
+            || petugasOf(resource.data.layananId));
+
+      // Mahasiswa membuat tiket miliknya sendiri saat layanan buka.
+      allow create: if isMahasiswa()
+        && request.resource.data.keys().hasOnly([
+            'layananId', 'uid', 'nomor', 'tanggal', 'status',
+            'keperluan', 'createdAt', 'calledAt', 'finishedAt'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'menunggu'
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.calledAt == null
+        && request.resource.data.finishedAt == null
+        && request.resource.data.keperluan is string
+        && get(/databases/$(database)/documents/layanan/$(request.resource.data.layananId))
+            .data.isOpen == true;
+
+      allow update:
+        // Petugas: menunggu -> dipanggil, dipanggil -> selesai / dilewati.
+        if (petugasOf(resource.data.layananId)
+            && request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['status', 'calledAt', 'finishedAt'])
+            && ((resource.data.status == 'menunggu'
+                  && request.resource.data.status == 'dipanggil')
+                || (resource.data.status == 'dipanggil'
+                  && request.resource.data.status in ['selesai', 'dilewati'])))
+        // Mahasiswa: hanya membatalkan tiketnya yang masih menunggu.
+        || (resource.data.uid == request.auth.uid
+            && resource.data.status == 'menunggu'
+            && request.resource.data.status == 'batal'
+            && request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['status']));
+
+      allow delete: if false;
+    }
+  }
+}
